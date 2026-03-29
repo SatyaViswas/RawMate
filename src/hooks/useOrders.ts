@@ -169,12 +169,23 @@ export const useOrders = (userId: string | null, userRole: 'vendor' | 'supplier'
     try {
       console.log('🔄 Orders: Placing orders for cart items:', cartItems);
       
+      if (!cartItems || cartItems.length === 0) {
+        toast.error('No items in cart');
+        return false;
+      }
+      
       const orderPromises = cartItems.map(async (item) => {
         const totalAmount = item.product.price * item.quantity;
+        const supplierId = item.product.supplier?.id;
+        
+        if (!supplierId) {
+          console.error('🔄 Orders: Missing supplier ID for item:', item);
+          throw new Error('Supplier information missing');
+        }
         
         console.log('🔄 Orders: Creating order for item:', {
           vendor_id: item.vendor_id,
-          supplier_id: item.product.supplier_id,
+          supplier_id: supplierId,
           product_id: item.product_id,
           quantity: item.quantity,
           total_amount: totalAmount,
@@ -185,13 +196,11 @@ export const useOrders = (userId: string | null, userRole: 'vendor' | 'supplier'
           .from('orders')
           .insert({
             vendor_id: item.vendor_id,
-            supplier_id: item.product.supplier_id,
+            supplier_id: supplierId,
             product_id: item.product_id,
             quantity: item.quantity,
             total_amount: totalAmount,
-            status: 'Pending',
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
+            status: 'Pending'
           });
       });
 
@@ -200,29 +209,30 @@ export const useOrders = (userId: string | null, userRole: 'vendor' | 'supplier'
       const errors = results.filter(result => result.error);
       if (errors.length > 0) {
         console.error('🔄 Orders: Order placement errors:', errors);
+        errors.forEach(error => console.error('Order error:', error.error));
         throw new Error('Some orders failed to place');
       }
 
-          console.log('🔄 Orders: All orders placed successfully');
-    toast.success('Orders placed successfully!');
-    
-    // The real-time subscription will automatically refresh the orders
-    // But we can also manually refresh to ensure immediate update
-    console.log('🔄 Orders: Triggering immediate order refresh...');
-    
-    // Immediate refresh after order placement
-    setTimeout(() => {
-      console.log('🔄 Orders: Executing immediate fetchOrders after order placement...');
-      fetchOrders();
-    }, 100);
-    
-    // Additional refresh after a short delay to ensure order is in database
-    setTimeout(() => {
-      console.log('🔄 Orders: Executing delayed fetchOrders after order placement...');
-      fetchOrders();
-    }, 1000);
-    
-    return true;
+      console.log('🔄 Orders: All orders placed successfully');
+      toast.success('Orders placed successfully!');
+      
+      // The real-time subscription will automatically refresh the orders
+      // But we can also manually refresh to ensure immediate update
+      console.log('🔄 Orders: Triggering immediate order refresh...');
+      
+      // Immediate refresh after order placement
+      setTimeout(() => {
+        console.log('🔄 Orders: Executing immediate fetchOrders after order placement...');
+        fetchOrders();
+      }, 100);
+      
+      // Additional refresh after a short delay to ensure order is in database
+      setTimeout(() => {
+        console.log('🔄 Orders: Executing delayed fetchOrders after order placement...');
+        fetchOrders();
+      }, 1000);
+      
+      return true;
     } catch (err) {
       console.error('🔄 Orders: Error placing orders:', err);
       const message = err instanceof Error ? err.message : 'Failed to place orders';
@@ -235,7 +245,9 @@ export const useOrders = (userId: string | null, userRole: 'vendor' | 'supplier'
   // Update order status and reduce stock if needed
   const updateOrderStatus = async (orderId: string, newStatus: string) => {
     try {
-      // Fetch the order to get current status, product_id, quantity, and stock_updated
+      console.log('🔄 Orders: Updating order status:', orderId, 'to:', newStatus);
+      
+      // Fetch the order to get current status, product_id, quantity
       const { data: order, error: orderError } = await supabase
         .from('orders')
         .select('*')
@@ -243,39 +255,51 @@ export const useOrders = (userId: string | null, userRole: 'vendor' | 'supplier'
         .single();
       if (orderError || !order) throw orderError || new Error('Order not found');
 
-      // Only reduce stock if status is being set to 'Packed' and not already reduced
-      if (newStatus === 'Packed' && !order.stock_updated) {
-        // Fetch the product to get current stock
-        const { data: product, error: productError } = await supabase
-          .from('products')
-          .select('stock')
-          .eq('id', order.product_id)
-          .single();
-        if (productError || !product) throw productError || new Error('Product not found');
-        const newStock = Math.max(0, product.stock - order.quantity);
-        // Update product stock
-        const { error: stockError } = await supabase
-          .from('products')
-          .update({ stock: newStock })
-          .eq('id', order.product_id);
-        if (stockError) throw stockError;
-        // Mark order as stock_updated
-        const { error: markError } = await supabase
-          .from('orders')
-          .update({ stock_updated: true })
-          .eq('id', orderId);
-        if (markError) throw markError;
+      // Reduce stock when status is set to 'Packed'
+      if (newStatus === 'Packed') {
+        try {
+          // Fetch the product to get current stock
+          const { data: product, error: productError } = await supabase
+            .from('products')
+            .select('stock')
+            .eq('id', order.product_id)
+            .maybeSingle();
+          if (productError) throw productError;
+          if (product) {
+            const newStock = Math.max(0, product.stock - order.quantity);
+            // Update product stock
+            const { error: stockError } = await supabase
+              .from('products')
+              .update({ stock: newStock })
+              .eq('id', order.product_id);
+            if (stockError) throw stockError;
+          }
+        } catch (stockErr) {
+          console.warn('🔄 Orders: Stock update failed, continuing with status update:', stockErr);
+        }
       }
-      // Update order status
+      
+      // Update order status with explicit updated_at timestamp
       const { error: statusError } = await supabase
         .from('orders')
-        .update({ status: newStatus })
+        .update({ 
+          status: newStatus,
+          updated_at: new Date().toISOString()
+        })
         .eq('id', orderId);
+      
       if (statusError) throw statusError;
-      // Refresh orders
+      
+      console.log('🔄 Orders: Order status updated successfully:', orderId, 'to:', newStatus);
+      
+      // Optimistically update local state for immediate UI feedback
+      setOrders(prev => prev.map(o => o.id === orderId ? { ...o, status: newStatus, updated_at: new Date().toISOString() as any } : o));
+      
+      // Refresh orders to show the updated status
       await fetchOrders();
       return true;
     } catch (err) {
+      console.error('🔄 Orders: Error updating order status:', err);
       setError(err instanceof Error ? err.message : 'Failed to update order status');
       return false;
     }
